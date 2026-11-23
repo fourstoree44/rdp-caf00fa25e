@@ -1,0 +1,106 @@
+name: Rdprzyk
+run-name: rdp rdprzyk-ec4167ebf953
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 355
+    env:
+      RDP_USER: rdpf9f9
+      RDP_HOST: rdprzyk-ec4167ebf953
+      GITHUB_TOKEN: ${{ github.token }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    steps:
+      - name: Membuat akun Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Membuat akun Windows '$env:RDP_USER'"
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER
+          if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) { throw 'Pembuatan akun gagal' }
+          Write-Host 'Akun siap dan masuk grup Administrators + Remote Desktop Users'
+      - name: Mengaktifkan Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host 'Mengaktifkan Remote Desktop'
+          $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $tcp = "$ts\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $ts -Name 'fDenyTSConnections' -Value 0 -Force
+          # NLA dimatikan supaya klien RDP di HP/Linux/Mac tetap bisa masuk
+          Set-ItemProperty -Path $tcp -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path $tcp -Name 'SecurityLayer' -Value 0 -Force
+
+          # Pakai netsh: grup firewall 'Remote Desktop' tidak selalu ada di runner
+          netsh advfirewall firewall delete rule name="Rdprzyk-3389" | Out-Null
+          netsh advfirewall firewall add rule name="Rdprzyk-3389" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Gagal membuka port 3389 di firewall' }
+
+          Set-Service -Name 'TermService' -StartupType Automatic
+          Restart-Service -Name 'TermService' -Force
+
+          $ok = $false
+          for ($i = 0; $i -lt 15 -and -not $ok; $i++) {
+            $ok = [bool](Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+            if (-not $ok) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ok) { throw 'Port 3389 belum mendengarkan setelah TermService dijalankan ulang' }
+          Write-Host 'Remote Desktop aktif di port 3389 (NLA mati)'
+          $global:LASTEXITCODE = 0
+      - name: Mengunduh bore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host 'Mengunduh bore v0.6.0'
+          $zip = Join-Path $env:RUNNER_TEMP 'bore.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'bore'
+          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Write-Host 'bore terpasang'
+      - name: Membuka tunnel dan menjaga RDP tetap hidup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bore = Join-Path (Join-Path $env:RUNNER_TEMP 'bore') 'bore.exe'
+
+          Write-Host 'Membuka tunnel TCP ke bore.pub'
+          $outLog = Join-Path $env:RUNNER_TEMP 'bore.out.log'
+          $errLog = Join-Path $env:RUNNER_TEMP 'bore.err.log'
+          $proc = Start-Process -FilePath $bore -ArgumentList 'local','3389','--to','bore.pub' `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
+
+          $addr = $null
+          for ($i = 0; $i -lt 30 -and -not $addr; $i++) {
+            Start-Sleep -Seconds 2
+            if ($proc.HasExited) { throw 'bore berhenti sebelum tunnel terbuka' }
+            $text = ''
+            foreach ($f in @($outLog, $errLog)) {
+              if (Test-Path $f) { $text += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
+            }
+            $m = [regex]::Match($text, 'bore\.pub:(\d+)')
+            if ($m.Success) { $addr = $m.Value }
+          }
+          if (-not $addr) { throw 'bore tidak memberi port publik' }
+
+          # Alamat ditulis ke file di repo: log job tidak andal dibaca lewat API selama job masih berjalan.
+          try {
+            $body = @{ message = 'addr'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($addr)) } | ConvertTo-Json
+            Invoke-RestMethod -Method Put -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/addr.txt" `
+              -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' } -Body $body -ContentType 'application/json' | Out-Null
+          } catch { Write-Host "Gagal menulis addr.txt: $($_.Exception.Message)" }
+
+          Write-Host "CLOUDRDP_READY addr=$addr"
+
+          # Kalau bore mati, port publik hilang, jadi gagalkan job.
+          while (-not $proc.HasExited) { Start-Sleep -Seconds 15 }
+          throw 'bore berhenti, tunnel terputus'
